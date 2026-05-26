@@ -67,7 +67,7 @@ DONE_WORDS = frozenset(
 # Verbatim lines — spoken via session.say() (TTS only, no LLM paraphrasing).
 HUSAIN_GREET = (
     "Hi, I'm Husain, founder of Maneuver — thanks for stopping by. "
-    "What does your company do?"
+    "What is the name of your company and what does it do?"
 )
 HUSAIN_TURN_1 = (
     "Thanks for sharing that. "
