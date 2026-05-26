@@ -1,0 +1,90 @@
+[
+  {
+    "name": "Ethan",
+    "company": "DevOps Infotech",
+    "problem": "Automate SDLC processes",
+    "timeline": "Three weeks",
+    "budget": "10,000 USD",
+    "follow_up_date": "2026-05-25 at 4:00 PM",
+    "email": "ommanuwal@gmail.com"
+  },
+  {
+    "name": null,
+    "company": "DG Infotech",
+    "problem": null,
+    "timeline": "within a week",
+    "budget": "thousand dollars",
+    "follow_up_date": "2026-05-26 at 12:00 PM UTC",
+    "email": "user_email"
+  },
+  {
+    "name": "Om",
+    "company": "DevOps Infotech",
+    "problem": null,
+    "timeline": null,
+    "budget": "around ten thousand dollars",
+    "follow_up_date": "2026-05-26 at 11:21 AM UTC",
+    "email": "om@example.com",
+    "transcript_summary": "Summary unavailable."
+  },
+  {
+    "name": null,
+    "company": null,
+    "problem": null,
+    "timeline": null,
+    "budget": null,
+    "follow_up_date": null,
+    "email": null,
+    "transcript_summary": "The client is a company called Cortex that specializes in software development lifecycle management (SDLC). Their main problem involves automating repetitive tasks such as data entry into customer information systems. The follow-up date scheduled for the next step of the project is two days after the initial call."
+  },
+  {
+    "name": null,
+    "company": "I'm working on automation of my company.",
+    "problem": null,
+    "timeline": null,
+    "budget": null,
+    "follow_up_date": " at ",
+    "email": "",
+    "transcript_summary": "The client's company is working on automation processes within their organization, specifically focusing on automating data entry workflows. The client identified data entry as their main challenge and pain point. A follow-up call has been scheduled to discuss how the client can automate their data entry process further."
+  },
+  {
+    "name": null,
+    "company": null,
+    "problem": null,
+    "timeline": null,
+    "budget": null,
+    "follow_up_date": null,
+    "email": null,
+    "transcript_summary": "Sara is the founder of Maneuver, a DevOps consultancy, and the client is seeking assistance with DevOps implementation. The main challenge is aligning team workflows and tools to improve efficiency. The follow-up date is scheduled for the client to specify their preferred date and time."
+  },
+  {
+    "name": null,
+    "company": null,
+    "problem": "automation",
+    "timeline": null,
+    "budget": null,
+    "follow_up_date": null,
+    "email": null,
+    "transcript_summary": "The client, DevOps Info Tech, identifies their main problem as automation challenges in their workflow processes. A discovery call has been scheduled with Sara to discuss these issues further; the follow-up date will be provided once all details are filled out by the client."
+  },
+  {
+    "name": null,
+    "company": null,
+    "problem": "data entry",
+    "timeline": null,
+    "budget": null,
+    "follow_up_date": null,
+    "email": null,
+    "transcript_summary": "The client's main problem is bugs in their data analysis workflows, specifically related to data entry issues. The discovery call has been scheduled with the client and will be followed up with Sara for proper scheduling at a later date."
+  },
+  {
+    "name": null,
+    "company": null,
+    "problem": null,
+    "timeline": null,
+    "budget": null,
+    "follow_up_date": null,
+    "email": null,
+    "transcript_summary": "Summary unavailable."
+  }
+]
