@@ -86,5 +86,30 @@
     "follow_up_date": null,
     "email": null,
     "transcript_summary": "Summary unavailable."
+  },
+  {
+    "name": null,
+    "company": null,
+    "problem": null,
+    "timeline": null,
+    "budget": null,
+    "follow_up_date": null,
+    "email": null,
+    "transcript_summary": "The client is a tech-focused data analysis agency, and their main problem is the need to automate repetitive tasks in the data entry process."
+  },
+  {
+    "name": null,
+    "company": "My company is a data analysis firm.",
+    "problem": "Data and the tasks.",
+    "timeline": null,
+    "budget": null,
+    "follow_up_date": "2026-06-06 at 19:17 (UTC)",
+    "email": "ommanuwal@gmail.com",
+    "scheduling_date": "2026-06-06",
+    "scheduling_time": "19:17",
+    "scheduling_timezone": "UTC",
+    "form_submitted": true,
+    "verbal_done": true,
+    "transcript_summary": "Client company: My company is a data analysis firm.. Main topic: Data and the tasks.. Follow-up call: 2026-06-06 at 19:17 (UTC). Contact email: ommanuwal@gmail.com."
   }
 ]

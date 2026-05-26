@@ -1,50 +1,98 @@
 import asyncio
-import logging
-import textwrap
 import json
+import logging
 import os
+import re
 import smtplib
+from dataclasses import asdict, dataclass
 from email.mime.text import MIMEText
-from dataclasses import dataclass, asdict
-from dotenv import load_dotenv
+from pathlib import Path
 
+from dotenv import load_dotenv
+from livekit import rtc
 from livekit.agents import (
     Agent,
-    AgentSession,
     AgentServer,
+    AgentSession,
+    ChatContext,
     JobContext,
     JobProcess,
     RunContext,
-    function_tool,
+    StopResponse,
     cli,
+    function_tool,
     room_io,
-    ChatContext,
 )
-
-from livekit.plugins import deepgram, silero
+from livekit.plugins import deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
-from livekit.plugins import openai
 
 logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
-SHARED_LLM = openai.LLM.with_ollama(
-    model="qwen2.5:3b",
-    base_url="http://localhost:11434/v1",
-    temperature=0.3,
+OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+
+LLM_HUSAIN = openai.LLM.with_ollama(
+    model=os.getenv("OLLAMA_MODEL_HUSAIN", "qwen2.5:1.5b"),
+    base_url=OLLAMA_BASE,
+    temperature=0.25,
 )
 
-MANEUVER_KB = """
-Maneuver is a Dubai-based AI automation agency that builds intelligent workflow systems for SMEs and enterprises.
-We specialise in Voice AI Agents for 24/7 customer support, WhatsApp automation, CRM integrations with HubSpot and Salesforce, and end-to-end custom workflow automation.
-Our process: Discovery, Scoping, Build (2-4 weeks), Deploy, Support.
-Case studies: Dubai hospitality group cut response time from 4 hours to 2 minutes. UAE industrial supplier saved 3 hours of daily manual work.
-Pricing starts from AED 15,000 per project. Retainer support from AED 3,000/month.
+LLM_SARA = openai.LLM.with_ollama(
+    model=os.getenv("OLLAMA_MODEL_SARA", "qwen2.5:1.5b"),
+    base_url=OLLAMA_BASE,
+    temperature=0.1,
+)
 
-ABOUT HUSAIN:
-Husain studied at SRM Institute of Science and Technology and worked at JP Morgan Chase and Deloitte before founding Maneuver.
-He is hands-on with every client and brings enterprise-grade rigour to SME automation.
-"""
+UI_TOPIC = "maneuver.ui"
+RPC_SUBMIT_SCHEDULING = "submit_scheduling"
+
+DONE_WORDS = frozenset(
+    {
+        "done",
+        "confirmed",
+        "filled",
+        "submitted",
+        "ready",
+        "yes",
+        "okay",
+        "ok",
+        "yeah",
+        "yep",
+        "all set",
+        "entered",
+        "finished",
+    }
+)
+
+# Verbatim lines — spoken via session.say() (TTS only, no LLM paraphrasing).
+HUSAIN_GREET = (
+    "Hi, I'm Husain, founder of Maneuver — thanks for stopping by. "
+    "What does your company do?"
+)
+HUSAIN_TURN_1 = (
+    "Thanks for sharing that. "
+    "What's the biggest workflow or automation challenge you're trying to solve right now?"
+)
+HUSAIN_TURN_2 = (
+    "That makes sense. We can go into the details on a proper call — "
+    "would you like to schedule a follow-up?"
+)
+HUSAIN_HANDOFF = (
+    "Perfect — I'll connect you with Sara on our team to book a time."
+)
+
+SARA_GREET = (
+    "Hi, I'm Sara from Maneuver. I'll help you book your follow-up with Husain. "
+    "Please enter your email, date, and time in the form on your screen, "
+    "click Confirm, then say done when you're finished."
+)
+SARA_NEED_FORM = (
+    "Please fill in your email, date, and time in the form on screen and click Confirm. "
+    "I won't ask for your email out loud."
+)
+SARA_NEED_DONE = (
+    "I have your details saved. Just say done when you're ready and I'll confirm."
+)
 
 
 @dataclass
@@ -56,356 +104,324 @@ class LeadInfo:
     budget: str | None = None
     follow_up_date: str | None = None
     email: str | None = None
+    scheduling_date: str | None = None
+    scheduling_time: str | None = None
+    scheduling_timezone: str | None = None
+    form_submitted: bool = False
+    verbal_done: bool = False
     transcript_summary: str | None = None
 
 
-def _send_email_sync(userdata: LeadInfo):
-    lead = asdict(userdata)
-    gmail_user = os.getenv("GMAIL_USER", "").strip()
-    gmail_pass = os.getenv("GMAIL_APP_PASSWORD", "").strip()
-    if not gmail_user or not gmail_pass:
-        raise ValueError("GMAIL_USER or GMAIL_APP_PASSWORD missing")
-    body = (
-        "New lead — Maneuver Talk-to-Founder\n\n"
-        f"Name:         {lead.get('name') or 'Not captured'}\n"
-        f"Company:      {lead.get('company') or 'Not captured'}\n"
-        f"Problem:      {lead.get('problem') or 'Not captured'}\n"
-        f"Timeline:     {lead.get('timeline') or 'Not captured'}\n"
-        f"Budget:       {lead.get('budget') or 'Not captured'}\n"
-        f"Follow-up:    {lead.get('follow_up_date') or 'Not scheduled'}\n"
-        f"Client Email: {lead.get('email') or 'Not captured'}\n\n"
-        f"Summary:\n{lead.get('transcript_summary') or 'Unavailable'}\n"
-    )
-    msg = MIMEText(body)
-    msg["Subject"] = f"[Lead] {lead.get('name') or 'Unknown'} — {lead.get('company') or 'Unknown'}"
-    msg["From"] = gmail_user
-    client_email = lead.get("email")
-    msg["To"] = f"{gmail_user}, {client_email}" if client_email and "@" in client_email else gmail_user
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(gmail_user, gmail_pass)
-        smtp.send_message(msg)
-    logger.info(f"Email sent to: {msg['To']}")
+def _msg_text(message) -> str:
+    if hasattr(message, "text_content") and message.text_content:
+        return message.text_content.strip()
+    return ""
 
 
-async def send_summary_email(userdata: LeadInfo):
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _send_email_sync, userdata)
-
-
-# ── Agent 1: Husain ────────────────────────────────────────────────────────────
-class FounderAgent(Agent):
-    AGENT_DISPLAY_NAME = "Husain"
-
-    def __init__(self, job_ctx: JobContext, chat_ctx=None):
-        self._job_ctx = job_ctx
-        self._turn_count = 0
-        self._handoff_triggered = False
-
-        kwargs = dict(
-            llm=openai.LLM.with_ollama(
-    model="qwen2.5:1.5b",
-    base_url="http://localhost:11434/v1",
-    temperature=0.3,
-),
-            stt=deepgram.STT(),
-            tts=deepgram.TTS(model="aura-2-neptune-en"),
-            instructions=textwrap.dedent(f"""
-                Your name is Husain. You are the founder of Maneuver, an AI automation agency in Dubai.
-                A potential client just landed on your website and you are speaking with them.
-
-                KNOWLEDGE BASE — use this to answer any questions about Maneuver or yourself:
-                {MANEUVER_KB}
-
-                STRICT CONVERSATION RULES:
-                - You ask EXACTLY 2 questions total. No more ever.
-                - Question 1: What does their company do?
-                - Question 2: What is their biggest workflow challenge?
-                - After 2 questions and their answers, say:
-                  "Sounds like there is something real here. I would love to go deeper on a proper call — would that work for you?"
-                - When they say yes or agree, say:
-                  "Perfect — I will hand you to Sara now, she handles our scheduling."
-                - Do not say anything else after that. The system will switch to Sara automatically.
-
-                Q&A MODE:
-                If they ask about Maneuver or your background at any point, answer from the knowledge base,
-                then return to the discovery flow naturally.
-
-                GUARDRAILS:
-                - Only discuss: their business, Maneuver services, your background, workflow automation.
-                - Off-topic: "That is outside what I can help with here."
-                - Rude or angry user: "I understand — let us focus on how I can help you."
-                - If asked if you are AI: "I am an AI assistant representing Husain."
-
-                VOICE RULES:
-                - Plain spoken English only. No markdown, no lists, no symbols, no asterisks.
-                - Max 2 sentences per reply. One question per turn. Never ask two things at once.
-                - Always respond. Never go silent.
-            """),
-        )
-        if chat_ctx:
-            kwargs["chat_ctx"] = chat_ctx
-        super().__init__(**kwargs)
-
-    async def on_enter(self):
-        await asyncio.sleep(0.5)
-        await self.session.generate_reply(
-            instructions=(
-                "Greet NOW before the user says anything. Say exactly: "
-                "Hi, I am Husain, founder of Maneuver — thanks for dropping by. "
-                "What does your company do?"
-            )
-        )
-
-    async def on_user_turn_completed(self, turn_ctx, new_message):
-        # Guard: if handoff already triggered, skip
-        if self._handoff_triggered:
-            return
-
-        self._turn_count += 1
-        logger.info(f"Husain turn count: {self._turn_count}")
-
-        # After turn 2, check if user shows interest and force handoff
-        if self._turn_count >= 2:
-            text = ""
-            if hasattr(new_message, "text_content") and new_message.text_content:
-                text = new_message.text_content.lower()
-            elif hasattr(new_message, "content") and new_message.content:
-                text = str(new_message.content).lower()
-
-            interest_words = [
-                "yes", "sure", "sounds good", "okay", "ok", "great",
-                "lets", "let's", "interested", "schedule", "call",
-                "yeah", "yep", "please", "definitely", "absolutely", "works"
-            ]
-
-            if any(w in text for w in interest_words):
-                self._handoff_triggered = True
-                logger.info("Interest detected — forcing handoff to Sara")
-
-                # Generate farewell reply first
-                await self.session.generate_reply(
-                    instructions=(
-                        "Say exactly one sentence: "
-                        "Perfect — I will hand you to Sara now, she handles our scheduling."
-                    )
-                )
-
-                # Switch agent immediately — no sleep, no race condition
-                self.session.update_agent(
-                    SchedulerAgent(
-                        job_ctx=self._job_ctx,
-                        userdata=self.session.userdata,
-                        chat_ctx=self.chat_ctx.copy(exclude_instructions=True),
-                    )
-                )
-                return
-
-        # Normal turn processing
-        await super().on_user_turn_completed(turn_ctx, new_message)
-
-    @function_tool()
-    async def update_lead_field(self, context: RunContext[LeadInfo], field: str, value: str):
-        """
-        Silently capture lead info whenever user shares name, company, problem, timeline, budget, email.
-        field: one of those keys. value: what they said. Never mention this to the user.
-        """
-        if hasattr(context.userdata, field):
-            setattr(context.userdata, field, value)
-            logger.info(f"Lead — {field}: {value}")
+def _normalize_email(raw: str | None) -> str | None:
+    if not raw:
         return None
+    e = raw.strip().lower()
+    return e if re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", e) else None
 
 
-# ── Agent 2: Sara ──────────────────────────────────────────────────────────────
-class SchedulerAgent(Agent):
-    AGENT_DISPLAY_NAME = "Sara"
+def _apply_form(ud: LeadInfo, payload: dict) -> bool:
+    email = _normalize_email(payload.get("email"))
+    date = (payload.get("date") or "").strip() or None
+    time_v = (payload.get("time") or "").strip() or None
+    tz = (payload.get("timezone") or "").strip() or None
+    if email:
+        ud.email = email
+    if date:
+        ud.scheduling_date = date
+    if time_v:
+        ud.scheduling_time = time_v
+    if tz:
+        ud.scheduling_timezone = tz
+    ud.form_submitted = bool(ud.email and ud.scheduling_date and ud.scheduling_time)
+    if ud.form_submitted:
+        tz_bit = f" ({ud.scheduling_timezone})" if ud.scheduling_timezone else ""
+        ud.follow_up_date = f"{ud.scheduling_date} at {ud.scheduling_time}{tz_bit}"
+    return ud.form_submitted
 
-    def __init__(self, job_ctx: JobContext, userdata: LeadInfo, chat_ctx=None):
-        self._job_ctx = job_ctx
-        self._userdata = userdata
-        self._booking_triggered = False
 
-        kwargs = dict(
-            llm=SHARED_LLM,
-            stt=deepgram.STT(),
-            tts=deepgram.TTS(model="aura-2-phoebe-en"),
-            instructions=textwrap.dedent("""
-                Your name is Sara. You are the scheduling assistant at Maneuver.
-                Husain has just handed this call to you to book a follow-up meeting.
+def _build_summary(ud: LeadInfo) -> str:
+    return (
+        f"Client company: {ud.company or 'not captured'}. "
+        f"Main topic: {ud.problem or 'not captured'}. "
+        f"Follow-up call: {ud.follow_up_date or 'not scheduled'}. "
+        f"Contact email: {ud.email or 'not captured'}."
+    )
 
-                YOUR ONLY PURPOSE: Book the follow-up call. Nothing else.
 
-                FLOW:
-                Step 1 — Greet immediately before user speaks. Introduce yourself as Sara.
-                Step 2 — Tell them to fill in their preferred date, time, and email in the form on screen.
-                Step 3 — Ask them to say "done" or "confirmed" when they have filled it in.
-                Step 4 — When they say done or confirmed, call confirm_booking with the details they mentioned.
-
-                GUARDRAILS:
-                - Only discuss scheduling. Refuse everything else politely.
-                - If asked about Maneuver: "Husain will cover that on your call!"
-                - If rude: "Let us get this sorted quickly for you." Then continue scheduling.
-                - Never ask for email verbally — the screen form handles it.
-                - Never go silent. Always respond immediately.
-
-                VOICE RULES:
-                - Plain English only. One sentence at a time.
-                - Never read out email addresses.
-            """),
+async def _publish_ui(room: rtc.Room, payload: dict) -> None:
+    try:
+        await room.local_participant.publish_data(
+            json.dumps(payload).encode(),
+            reliable=True,
+            topic=UI_TOPIC,
         )
+        if payload.get("type") == "active_agent":
+            await room.local_participant.set_attributes(
+                {"maneuver.agent": payload["agent"]}
+            )
+    except Exception as exc:
+        logger.warning("UI publish failed: %s", exc)
+
+
+async def _speak(session: AgentSession, text: str) -> None:
+    """Speak exact text through TTS — bypasses the LLM so Qwen cannot improvise."""
+    logger.info("SPEAK: %s", text[:100])
+    handle = session.say(text, allow_interruptions=False, add_to_chat_ctx=True)
+    await handle.wait_for_playout()
+
+
+def _send_email_sync(ud: LeadInfo) -> None:
+    founder = os.getenv("GMAIL_USER", "").strip()
+    password = os.getenv("GMAIL_APP_PASSWORD", "").strip()
+    if not founder or not password:
+        raise ValueError("GMAIL_USER / GMAIL_APP_PASSWORD missing in .env.local")
+
+    client = ud.email
+    if not client or "@" not in client:
+        raise ValueError("No client email from scheduling form — cannot send confirmation")
+
+    body = (
+        "Maneuver — Talk to the Founder\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "DISCOVERY\n"
+        f"  Company:   {ud.company or 'Not captured'}\n"
+        f"  Problem:   {ud.problem or 'Not captured'}\n"
+        f"  Timeline:  {ud.timeline or 'Not captured'}\n"
+        f"  Budget:    {ud.budget or 'Not captured'}\n\n"
+        "SCHEDULED FOLLOW-UP (from booking form)\n"
+        f"  Date:      {ud.scheduling_date or '—'}\n"
+        f"  Time:      {ud.scheduling_time or '—'}\n"
+        f"  Timezone:  {ud.scheduling_timezone or '—'}\n"
+        f"  Combined:  {ud.follow_up_date or 'Not scheduled'}\n"
+        f"  Email:     {client}\n\n"
+        f"Notes:\n{ud.transcript_summary or _build_summary(ud)}\n\n"
+        "— Maneuver scheduling system"
+    )
+
+    msg = MIMEText(body)
+    msg["Subject"] = f"Maneuver follow-up confirmed — {ud.company or 'New lead'}"
+    msg["From"] = founder
+    msg["To"] = client
+    msg["Cc"] = founder
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(founder, password)
+        smtp.send_message(msg)
+    logger.info("Email sent To=%s Cc=%s", client, founder)
+
+
+async def send_summary_email(ud: LeadInfo) -> None:
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _send_email_sync, ud)
+
+
+# ── Husain ─────────────────────────────────────────────────────────────────────
+class FounderAgent(Agent):
+    def __init__(self, job_ctx: JobContext, chat_ctx: ChatContext | None = None):
+        self._job_ctx = job_ctx
+        self._turn = 0
+        self._handoff = False
+        kwargs = {
+            "llm": LLM_HUSAIN,
+            "stt": deepgram.STT(),
+            "tts": deepgram.TTS(model="aura-2-neptune-en"),
+            # LLM stays wired for the pipeline but Husain never calls generate_reply — only say().
+            "instructions": "You are Husain. All spoken lines are pre-scripted by the system.",
+        }
         if chat_ctx:
             kwargs["chat_ctx"] = chat_ctx
         super().__init__(**kwargs)
 
-    async def on_enter(self):
-        await asyncio.sleep(0.5)
-        await self.session.generate_reply(
-            instructions=(
-                "Greet IMMEDIATELY. Do not wait for user to speak. Say exactly: "
-                "Hi, I am Sara from Maneuver! "
-                "Please fill in your preferred date, time, and email in the form on screen, "
-                "then just say done when you are ready and I will confirm your booking."
-            )
-        )
+    async def on_enter(self) -> None:
+        await _publish_ui(self._job_ctx.room, {"type": "active_agent", "agent": "husain"})
+        await _speak(self.session, HUSAIN_GREET)
 
-    async def on_user_turn_completed(self, turn_ctx, new_message):
-        if self._booking_triggered:
-            return
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        if self._handoff:
+            raise StopResponse()
 
-        text = ""
-        if hasattr(new_message, "text_content") and new_message.text_content:
-            text = new_message.text_content.lower()
-        elif hasattr(new_message, "content") and new_message.content:
-            text = str(new_message.content).lower()
+        self._turn += 1
+        text = _msg_text(new_message)
+        ud = self.session.userdata
+        logger.info("Husain turn %s", self._turn)
 
-        confirm_words = ["done", "confirmed", "filled", "submitted", "ready", "yes", "okay", "ok", "entered"]
-
-        if any(w in text for w in confirm_words):
-            self._booking_triggered = True
-            logger.info("Booking confirmation detected — switching to SummaryAgent")
-
-            await self.session.generate_reply(
-                instructions=(
-                    "Say exactly one sentence: "
-                    "Great — your booking is confirmed, let me wrap this up for you."
+        if self._turn == 1:
+            if text:
+                ud.problem = text[:200]
+                if not ud.company:
+                    ud.company = text[:120]
+                await _publish_ui(
+                    self._job_ctx.room,
+                    {"type": "lead_field", "field": "problem", "value": ud.problem},
                 )
-            )
+            await _speak(self.session, HUSAIN_TURN_1)
+            raise StopResponse()
 
-            self.session.update_agent(
-                SummaryAgent(
-                    job_ctx=self._job_ctx,
-                    userdata=self._userdata,
-                    chat_ctx=self.chat_ctx.copy(exclude_instructions=True),
+        if self._turn == 2:
+            if text:
+                ud.problem = text[:200]
+                await _publish_ui(
+                    self._job_ctx.room,
+                    {"type": "lead_field", "field": "problem", "value": ud.problem},
                 )
-            )
+            await _speak(self.session, HUSAIN_TURN_2)
+            raise StopResponse()
+
+        if self._turn == 3:
+            await self._handoff_to_sara()
+            raise StopResponse()
+
+        raise StopResponse()
+
+    async def _handoff_to_sara(self) -> None:
+        if self._handoff:
             return
-
-        await super().on_user_turn_completed(turn_ctx, new_message)
-
-    @function_tool()
-    async def confirm_booking(self, context: RunContext[LeadInfo], date: str, time: str, email: str):
-        """
-        Call when user verbally confirms they filled the form.
-        date: e.g. 'June 3rd', time: e.g. '3 PM GST', email: from screen form.
-        """
-        if self._booking_triggered:
-            return None
-        self._booking_triggered = True
-        context.userdata.follow_up_date = f"{date} at {time}"
-        context.userdata.email = email
-        logger.info(f"Booking tool — {date} at {time}, {email}")
+        self._handoff = True
+        await _speak(self.session, HUSAIN_HANDOFF)
+        await asyncio.sleep(0.4)
         self.session.update_agent(
-            SummaryAgent(
+            SchedulerAgent(
                 job_ctx=self._job_ctx,
-                userdata=context.userdata,
+                userdata=self.session.userdata,
                 chat_ctx=self.chat_ctx.copy(exclude_instructions=True),
             )
         )
+
+    @function_tool()
+    async def update_lead_field(self, context: RunContext[LeadInfo], field: str, value: str):
+        """Capture name, company, problem, timeline, budget when mentioned."""
+        if field in {"name", "company", "problem", "timeline", "budget"}:
+            setattr(context.userdata, field, value)
+            await _publish_ui(
+                self._job_ctx.room,
+                {"type": "lead_field", "field": field, "value": value},
+            )
         return None
 
 
-# ── Agent 3: System ────────────────────────────────────────────────────────────
-class SummaryAgent(Agent):
-    AGENT_DISPLAY_NAME = "System"
-
-    def __init__(self, job_ctx: JobContext, userdata: LeadInfo, chat_ctx=None):
+# ── Sara (hardcoded turns — form is source of truth) ───────────────────────────
+class SchedulerAgent(Agent):
+    def __init__(
+        self,
+        job_ctx: JobContext,
+        userdata: LeadInfo,
+        chat_ctx: ChatContext | None = None,
+    ):
         self._job_ctx = job_ctx
         self._userdata = userdata
-        kwargs = dict(
-            llm=SHARED_LLM,
-            stt=deepgram.STT(),
-            tts=deepgram.TTS(model="aura-2-cordelia-en"),
-            instructions="Close this call. State the confirmed date. Thank them warmly. Two sentences max.",
-        )
+        self._done = False
+        self._reminders = 0
+        kwargs = {
+            "llm": LLM_SARA,
+            "stt": deepgram.STT(),
+            "tts": deepgram.TTS(model="aura-2-phoebe-en"),
+            "instructions": "You are Sara. All spoken lines are pre-scripted by the system.",
+        }
         if chat_ctx:
             kwargs["chat_ctx"] = chat_ctx
         super().__init__(**kwargs)
 
-    async def on_enter(self):
-        # 1. Generate summary
-        try:
-            summary_ctx = ChatContext()
-            summary_ctx.add_message(
-                role="system",
-                content=(
-                    "Summarise this discovery call in 3 sentences: "
-                    "who the client is, their main problem, and the follow-up date scheduled."
-                )
-            )
-            for item in self.chat_ctx.items:
-                if hasattr(item, "role") and hasattr(item, "text_content"):
-                    if item.role in ("user", "assistant") and item.text_content:
-                        summary_ctx.add_message(
-                            role="user",
-                            content=f"{item.role}: {item.text_content}"
-                        )
-            response = await SHARED_LLM.chat(chat_ctx=summary_ctx).collect()
-            self._userdata.transcript_summary = response.text
-            logger.info(f"Summary: {self._userdata.transcript_summary}")
-        except Exception as e:
-            logger.error(f"Summary failed: {e}")
-            self._userdata.transcript_summary = "Summary unavailable."
+    async def on_enter(self) -> None:
+        await _publish_ui(self._job_ctx.room, {"type": "active_agent", "agent": "sara"})
+        await _speak(self.session, SARA_GREET)
 
-        # 2. Save JSON
-        output_path = "leads.json"
-        leads = []
-        if os.path.exists(output_path):
-            with open(output_path, "r") as f:
-                try:
-                    leads = json.load(f)
-                except json.JSONDecodeError:
-                    leads = []
-        leads.append(asdict(self._userdata))
-        with open(output_path, "w") as f:
-            json.dump(leads, f, indent=2)
-        logger.info("Lead saved to leads.json")
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        if self._done:
+            raise StopResponse()
 
-        # 3. Send email
-        try:
-            await send_summary_email(self._userdata)
-        except Exception as e:
-            logger.error(f"Email failed: {e}")
+        text = _msg_text(new_message).lower()
+        if any(w in text for w in DONE_WORDS):
+            self._userdata.verbal_done = True
 
-        # 4. Close call
-        follow_up = self._userdata.follow_up_date or "the scheduled time"
+        ud = self._userdata
+        logger.info("Sara — verbal_done=%s form=%s email=%s", ud.verbal_done, ud.form_submitted, ud.email)
+
+        if ud.form_submitted and ud.verbal_done:
+            await self._finish()
+            raise StopResponse()
+
+        if not ud.form_submitted:
+            self._reminders += 1
+            await _speak(self.session, SARA_NEED_FORM)
+            raise StopResponse()
+
+        await _speak(self.session, SARA_NEED_DONE)
+        raise StopResponse()
+
+    async def _finish(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        ud = self._userdata
+        slot = ud.follow_up_date or "your selected time"
+        email = ud.email or ""
+
+        await _speak(
+            self.session,
+            f"Thanks — your follow-up is booked for {slot}. "
+            f"We'll send confirmation to {email}.",
+        )
         await asyncio.sleep(0.3)
-        await self.session.generate_reply(
-            instructions=(
-                f"Say warmly and finally: "
-                f"You are all set — Husain is looking forward to speaking with you on {follow_up}. "
-                "Thank them genuinely and say goodbye. Two sentences max. Sound warm and final."
-            )
+        self.session.update_agent(SummaryAgent(job_ctx=self._job_ctx, userdata=ud))
+
+
+# ── System ─────────────────────────────────────────────────────────────────────
+class SummaryAgent(Agent):
+    def __init__(self, job_ctx: JobContext, userdata: LeadInfo):
+        self._job_ctx = job_ctx
+        self._userdata = userdata
+        super().__init__(
+            llm=LLM_HUSAIN,
+            stt=deepgram.STT(),
+            tts=deepgram.TTS(model="aura-2-saturn-en"),
+            instructions="Scripted closing agent.",
         )
 
-        # 5. End session after TTS finishes
-        await asyncio.sleep(5)
+    async def on_enter(self) -> None:
+        await _publish_ui(self._job_ctx.room, {"type": "active_agent", "agent": "system"})
+        ud = self._userdata
+        ud.transcript_summary = _build_summary(ud)
+
+        slot = ud.follow_up_date or "your scheduled time"
+        await _speak(
+            self.session,
+            f"You're all set for {slot}. "
+            "Husain is looking forward to speaking with you. Thank you for your time — goodbye.",
+        )
+
+        out = Path(__file__).parent.parent / "leads.json"
+        leads = []
+        if out.exists():
+            try:
+                leads = json.loads(out.read_text())
+            except json.JSONDecodeError:
+                pass
+        leads.append(asdict(ud))
+        out.write_text(json.dumps(leads, indent=2))
+
+        if ud.form_submitted and ud.email:
+            try:
+                await send_summary_email(ud)
+                logger.info("Confirmation email sent to %s", ud.email)
+            except Exception as exc:
+                logger.error("Email failed: %s", exc)
+        else:
+            logger.error("Skipped email — form not submitted or missing email")
+
+        await _publish_ui(self._job_ctx.room, {"type": "session_ended"})
+        await asyncio.sleep(4)
         try:
             await self._job_ctx.room.disconnect()
-            logger.info("Session ended.")
-        except Exception as e:
-            logger.error(f"Session end error: {e}")
+        except Exception as exc:
+            logger.error("Disconnect: %s", exc)
 
 
-# ── Server ─────────────────────────────────────────────────────────────────────
 server = AgentServer()
 
 
@@ -416,10 +432,53 @@ def prewarm(proc: JobProcess):
 server.setup_fnc = prewarm
 
 
+def _wire_form_handlers(ctx: JobContext, session: AgentSession[LeadInfo]) -> None:
+    async def ingest(payload: dict) -> None:
+        ok = _apply_form(session.userdata, payload)
+        logger.info("Form ingested ok=%s email=%s slot=%s", ok, session.userdata.email, session.userdata.follow_up_date)
+        await _publish_ui(
+            ctx.room,
+            {
+                "type": "scheduling_submitted",
+                "email": session.userdata.email,
+                "date": session.userdata.scheduling_date,
+                "time": session.userdata.scheduling_time,
+                "timezone": session.userdata.scheduling_timezone,
+            },
+        )
+        agent = session.current_agent
+        if (
+            ok
+            and session.userdata.verbal_done
+            and isinstance(agent, SchedulerAgent)
+            and not agent._done
+        ):
+            asyncio.create_task(agent._finish())
+
+    @ctx.room.local_participant.register_rpc_method(RPC_SUBMIT_SCHEDULING)
+    async def submit_scheduling(data: rtc.RpcInvocationData) -> str:
+        try:
+            payload = json.loads(data.payload or "{}")
+        except json.JSONDecodeError:
+            return json.dumps({"ok": False})
+        await ingest(payload)
+        return json.dumps({"ok": True, "email": session.userdata.email})
+
+    @ctx.room.on("data_received")
+    def on_data(pkt: rtc.DataPacket):
+        if getattr(pkt, "topic", None) and pkt.topic != UI_TOPIC:
+            return
+        try:
+            msg = json.loads(pkt.data.decode())
+        except Exception:
+            return
+        if msg.get("type") in ("scheduling_form", "scheduling_submit"):
+            asyncio.create_task(ingest(msg))
+
+
 @server.rtc_session(agent_name="maneuver")
 async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
-    logger.info(f"Session started — room: {ctx.room.name}")
 
     session = AgentSession[LeadInfo](
         userdata=LeadInfo(),
@@ -431,13 +490,11 @@ async def my_agent(ctx: JobContext):
     await session.start(
         agent=FounderAgent(job_ctx=ctx),
         room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(),
-        ),
+        room_options=room_io.RoomOptions(audio_input=room_io.AudioInputOptions()),
     )
-
     await ctx.connect()
-    logger.info("Agent connected")
+    _wire_form_handlers(ctx, session)
+    await _publish_ui(ctx.room, {"type": "active_agent", "agent": "husain"})
 
 
 if __name__ == "__main__":
