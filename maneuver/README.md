@@ -19,6 +19,72 @@ The starter project includes:
 
 This starter app is compatible with any [custom web/mobile frontend](https://docs.livekit.io/frontends/) or [telephony](https://docs.livekit.io/telephony/).
 
+## Talk-to-Founder LiveKit (Maneuver) — Clone & Run
+
+Repository: [`talk-to-founder-livekit`](https://github.com/CRAFTYPROGRAMMER826/talk-to-founder-livekit)
+
+Clone (choose one):
+
+- HTTPS: `git clone https://github.com/CRAFTYPROGRAMMER826/talk-to-founder-livekit.git`
+- SSH: `git clone git@github.com:CRAFTYPROGRAMMER826/talk-to-founder-livekit.git`
+- GitHub CLI: `gh repo clone CRAFTYPROGRAMMER826/talk-to-founder-livekit`
+
+### Backend prerequisites
+
+- Ollama running locally (for Qwen models)
+- Deepgram API key (STT/TTS)
+- Gmail credentials (Gmail App Password)
+- LiveKit credentials
+
+### Environment variables
+
+1. `maneuver/.env.local` (copy from `maneuver/.env.example`)
+   - `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
+   - `DEEPGRAM_API_KEY`
+   - `GMAIL_USER`, `GMAIL_APP_PASSWORD`
+   - `OLLAMA_BASE_URL`, `OLLAMA_MODEL_HUSAIN`, `OLLAMA_MODEL_SARA`
+
+### Install dependencies
+
+Backend:
+
+```bash
+cd maneuver
+uv sync
+```
+
+Frontend:
+
+```bash
+cd my-agent-app
+pnpm install
+```
+
+### Start everything (local-only)
+
+1. Start Ollama (separate terminal):
+
+```bash
+ollama serve
+```
+
+2. Start LiveKit agent backend:
+
+```bash
+cd maneuver
+uv run python src/agent.py dev
+```
+
+3. Start React UI:
+
+```bash
+cd my-agent-app
+pnpm dev
+```
+
+Open the frontend, speak into the microphone, and the flow should go:
+Husain (discovery) → Sara (scheduling) → System (wrap-up + email if the form was submitted).
+
 ## Using coding agents
 
 This project is designed to work with coding agents like [Claude Code](https://claude.com/product/claude-code), [Cursor](https://www.cursor.com/), and [Codex](https://openai.com/codex/).
@@ -70,6 +136,20 @@ The CLI clones the template and configures your environment. Then follow the res
 
 Clone the repository and install dependencies to a virtual environment:
 
+### Building the React Frontend using pnpm
+
+```console
+pnpm create vite@latest my-agent-app --template react-ts
+cd my-agent-app
+```
+
+###install packages
+```
+pnpm add @livekit/components-react @livekit/components-styles livekit-client
+```
+
+
+### Building the agentic workflow
 ```console
 cd agent-starter-python
 uv sync
@@ -109,6 +189,22 @@ To run the agent for use with a frontend or telephony, use the `dev` command:
 ```console
 uv run python src/agent.py dev
 ```
+Agent Can be interacted with on the frontend server, when using the `dev` command:
+simply open another terminal window and run 
+
+```console
+cd livekit/my-agent-app
+pnpm run dev 
+```
+or
+if using npm
+```console
+npm run dev
+```
+
+```console
+ run python src/agent.py dev
+```
 
 In production, use the `start` command:
 
@@ -116,6 +212,33 @@ In production, use the `start` command:
 uv run python src/agent.py start
 ```
 
+
+## Build the Frontend
+
+### with npm
+```console
+cd livekit
+npm create vite@latest my-agent-app -- --template react-ts
+cd my-agent-app
+```
+
+### with pnpm
+```console
+cd livekit
+pnpm create vite@latest my-agent-app --template react-ts
+cd my-agent-app
+```
+
+### Install packages
+## with npm
+```console
+npm install @livekit/components-react @livekit/components-styles livekit-client --save
+```
+
+## with pnpm
+```console
+pnpm add @livekit/components-react @livekit/components-styles livekit-client
+```
 ## Frontend & Telephony
 
 Get started quickly with our pre-built frontend starter apps, or add telephony support:

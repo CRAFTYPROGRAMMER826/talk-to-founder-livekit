@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -34,13 +35,13 @@ OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 LLM_HUSAIN = openai.LLM.with_ollama(
     model=os.getenv("OLLAMA_MODEL_HUSAIN", "qwen2.5:1.5b"),
     base_url=OLLAMA_BASE,
-    temperature=0.25,
+    temperature=0.6,
 )
 
 LLM_SARA = openai.LLM.with_ollama(
     model=os.getenv("OLLAMA_MODEL_SARA", "qwen2.5:1.5b"),
     base_url=OLLAMA_BASE,
-    temperature=0.1,
+    temperature=0.4,
 )
 
 UI_TOPIC = "maneuver.ui"
@@ -64,22 +65,32 @@ DONE_WORDS = frozenset(
     }
 )
 
+MANEUVER_KB = """
+Maneuver is a Dubai-based AI automation agency that builds intelligent workflow systems for SMEs.
+Services: Voice AI Agents for 24/7 support, WhatsApp automation, CRM integrations (HubSpot, Salesforce), and custom workflow automation.
+Process: Discovery → Scoping → Build (2-4 weeks) → Deploy → Support.
+Case studies: Dubai hospitality group cut response time from 4 hours to 2 minutes; an industrial supplier saved roughly 3 hours of manual work per day.
+Pricing starts from AED 15,000 per project; retainer support from AED 3,000/month.
+
+Husain is the founder (studied at SRM; worked at JP Morgan Chase and Deloitte). He is hands-on and asks sharp workflow questions before proposing solutions.
+"""
+
 # Verbatim lines — spoken via session.say() (TTS only, no LLM paraphrasing).
 HUSAIN_GREET = (
     "Hi, I'm Husain, founder of Maneuver — thanks for stopping by. "
     "What is the name of your company and what does it do?"
 )
 HUSAIN_TURN_1 = (
-    "Thanks for sharing that. "
+    "I appreciate you sharing your thoughts, it helps me understand you better. "
     "What's the biggest workflow or automation challenge you're trying to solve right now?"
 )
 HUSAIN_TURN_2 = (
-    "That makes sense. We can go into the details on a proper call — "
-    "would you like to schedule a follow-up?"
+    "That makes sense. We can discuss this in detail on another call — "
+    "would you like to schedule a call?"
 )
-HUSAIN_HANDOFF = (
-    "Perfect — I'll connect you with Sara on our team to book a time."
-)
+HUSAIN_HANDOFF = "Perfect — I'll connect you with Sara on our team to book a time."
+
+HUSAIN_END_NO = "I appreciate you taking the time today feel free to contact me again if you think maneuver's services can help your company scale"
 
 SARA_GREET = (
     "Hi, I'm Sara from Maneuver. I'll help you book your follow-up with Husain. "
@@ -176,6 +187,99 @@ async def _speak(session: AgentSession, text: str) -> None:
     await handle.wait_for_playout()
 
 
+def _schedule_user_wants_call(text: str) -> bool:
+    """Heuristic for yes/no scheduling based on the user's transcript."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    positive = {
+        "yes",
+        "yeah",
+        "yep",
+        "sure",
+        "okay",
+        "ok",
+        "great",
+        "lets",
+        "let's",
+        "interested",
+        "schedule",
+        "call",
+        "book",
+        "please",
+        "definitely",
+        "absolutely",
+        "would love",
+        "love to",
+    }
+    negative = {
+        "no",
+        "nope",
+        "not",
+        "never",
+        "later",
+        "not now",
+        "maybe later",
+        "can't",
+        "cannot",
+        "don't",
+        "dont",
+        "stop",
+        "cancel",
+    }
+
+    # If they clearly say "no" (or variants), don't hand off.
+    if any(n in t for n in negative):
+        return False
+    return any(p in t for p in positive)
+
+
+def _sanitize_middle_fragment(fragment: str) -> str:
+    # Avoid adding punctuation that would create extra questions/sentences.
+    f = (fragment or "").replace("\n", " ").strip()
+    f = f.replace("?", "")
+    f = f.replace("!", "").replace(".", "")
+    f = f.replace("—", "-")
+    f = re.sub(r"\s+", " ", f).strip()
+    return f[:60].strip()
+
+
+async def _llm_middle_for_husain(user_text: str, *, mode: str) -> str:
+    """
+    Create a short insertion phrase (<=60 chars) to be spoken as part of a fixed script.
+    Must never include questions, email addresses, dates, or times.
+    """
+    user_text = (user_text or "").strip()
+    if not user_text:
+        return ""
+
+    sys = (
+        "You are Maneuver voice Husain. Produce ONLY a short insertion phrase to insert "
+        "between fixed scripted sentences. "
+        "Rules: max 60 characters, no question marks, no emails, no dates/times, "
+        "no markdown, and no extra greetings. "
+        "If user asks about Maneuver/services/process/pricing, answer briefly from the KB. "
+        "If user is rude/angry or off-topic, respond calmly and redirect to workflows."
+    )
+
+    ctx = ChatContext()
+    ctx.add_message(role="system", content=sys)
+    ctx.add_message(role="system", content=f"Knowledge base:\n{MANEUVER_KB}")
+    ctx.add_message(
+        role="user", content=f"Mode={mode}. User said: {user_text}\nInsertion phrase:"
+    )
+
+    try:
+        resp = await LLM_HUSAIN.chat(chat_ctx=ctx).collect()
+        frag = (resp.text or "").strip()
+    except Exception as exc:
+        logger.warning("LLM middle generation failed: %s", exc)
+        return ""
+
+    return _sanitize_middle_fragment(frag)
+
+
 def _send_email_sync(ud: LeadInfo) -> None:
     founder = os.getenv("GMAIL_USER", "").strip()
     password = os.getenv("GMAIL_APP_PASSWORD", "").strip()
@@ -184,7 +288,9 @@ def _send_email_sync(ud: LeadInfo) -> None:
 
     client = ud.email
     if not client or "@" not in client:
-        raise ValueError("No client email from scheduling form — cannot send confirmation")
+        raise ValueError(
+            "No client email from scheduling form — cannot send confirmation"
+        )
 
     body = (
         "Maneuver — Talk to the Founder\n"
@@ -239,7 +345,9 @@ class FounderAgent(Agent):
         super().__init__(**kwargs)
 
     async def on_enter(self) -> None:
-        await _publish_ui(self._job_ctx.room, {"type": "active_agent", "agent": "husain"})
+        await _publish_ui(
+            self._job_ctx.room, {"type": "active_agent", "agent": "husain"}
+        )
         await _speak(self.session, HUSAIN_GREET)
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
@@ -253,14 +361,34 @@ class FounderAgent(Agent):
 
         if self._turn == 1:
             if text:
-                ud.problem = text[:200]
-                if not ud.company:
-                    ud.company = text[:120]
+                ud.company = text[:160]
+                # Best-effort: if they already include the core pain, capture it.
+                if any(
+                    k in text.lower()
+                    for k in (
+                        "pain",
+                        "challenge",
+                        "workflow",
+                        "automation",
+                        "process",
+                        "struggle",
+                        "bottleneck",
+                        "manual",
+                    )
+                ):
+                    ud.problem = text[:200]
                 await _publish_ui(
                     self._job_ctx.room,
-                    {"type": "lead_field", "field": "problem", "value": ud.problem},
+                    {"type": "lead_field", "field": "company", "value": ud.company},
                 )
-            await _speak(self.session, HUSAIN_TURN_1)
+            middle = await _llm_middle_for_husain(text, mode="discovery")
+            spoken = HUSAIN_TURN_1
+            if middle:
+                spoken = spoken.replace(
+                    "I appreciate you sharing your thoughts, it helps me understand you better. ",
+                    f"I appreciate you sharing your thoughts, it helps me understand you better. {middle} ",
+                )
+            await _speak(self.session, spoken)
             raise StopResponse()
 
         if self._turn == 2:
@@ -270,11 +398,37 @@ class FounderAgent(Agent):
                     self._job_ctx.room,
                     {"type": "lead_field", "field": "problem", "value": ud.problem},
                 )
-            await _speak(self.session, HUSAIN_TURN_2)
+            middle = await _llm_middle_for_husain(text, mode="schedule")
+            spoken = HUSAIN_TURN_2
+            if middle:
+                spoken = spoken.replace(
+                    "That makes sense. ", f"That makes sense. {middle} "
+                )
+            await _speak(self.session, spoken)
             raise StopResponse()
 
         if self._turn == 3:
-            await self._handoff_to_sara()
+            if _schedule_user_wants_call(text):
+                await self._handoff_to_sara()
+            else:
+                # Negative scheduling response: end the call without handing off.
+                await _speak(self.session, HUSAIN_END_NO)
+                ud.transcript_summary = _build_summary(ud)
+
+                out_path = Path(__file__).parent.parent / "leads.json"
+                leads = []
+                if out_path.exists():
+                    try:
+                        leads = json.loads(out_path.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError:
+                        leads = []
+                leads.append(asdict(ud))
+                out_path.write_text(json.dumps(leads, indent=2), encoding="utf-8")
+
+                await _publish_ui(self._job_ctx.room, {"type": "session_ended"})
+                await asyncio.sleep(1.5)
+                with contextlib.suppress(Exception):
+                    await self._job_ctx.room.disconnect()
             raise StopResponse()
 
         raise StopResponse()
@@ -294,7 +448,9 @@ class FounderAgent(Agent):
         )
 
     @function_tool()
-    async def update_lead_field(self, context: RunContext[LeadInfo], field: str, value: str):
+    async def update_lead_field(
+        self, context: RunContext[LeadInfo], field: str, value: str
+    ):
         """Capture name, company, problem, timeline, budget when mentioned."""
         if field in {"name", "company", "problem", "timeline", "budget"}:
             setattr(context.userdata, field, value)
@@ -340,7 +496,12 @@ class SchedulerAgent(Agent):
             self._userdata.verbal_done = True
 
         ud = self._userdata
-        logger.info("Sara — verbal_done=%s form=%s email=%s", ud.verbal_done, ud.form_submitted, ud.email)
+        logger.info(
+            "Sara — verbal_done=%s form=%s email=%s",
+            ud.verbal_done,
+            ud.form_submitted,
+            ud.email,
+        )
 
         if ud.form_submitted and ud.verbal_done:
             await self._finish()
@@ -384,7 +545,9 @@ class SummaryAgent(Agent):
         )
 
     async def on_enter(self) -> None:
-        await _publish_ui(self._job_ctx.room, {"type": "active_agent", "agent": "system"})
+        await _publish_ui(
+            self._job_ctx.room, {"type": "active_agent", "agent": "system"}
+        )
         ud = self._userdata
         ud.transcript_summary = _build_summary(ud)
 
@@ -398,10 +561,8 @@ class SummaryAgent(Agent):
         out = Path(__file__).parent.parent / "leads.json"
         leads = []
         if out.exists():
-            try:
+            with contextlib.suppress(json.JSONDecodeError):
                 leads = json.loads(out.read_text())
-            except json.JSONDecodeError:
-                pass
         leads.append(asdict(ud))
         out.write_text(json.dumps(leads, indent=2))
 
@@ -433,9 +594,16 @@ server.setup_fnc = prewarm
 
 
 def _wire_form_handlers(ctx: JobContext, session: AgentSession[LeadInfo]) -> None:
+    pending_tasks: list[asyncio.Task[None]] = []
+
     async def ingest(payload: dict) -> None:
         ok = _apply_form(session.userdata, payload)
-        logger.info("Form ingested ok=%s email=%s slot=%s", ok, session.userdata.email, session.userdata.follow_up_date)
+        logger.info(
+            "Form ingested ok=%s email=%s slot=%s",
+            ok,
+            session.userdata.email,
+            session.userdata.follow_up_date,
+        )
         await _publish_ui(
             ctx.room,
             {
@@ -453,7 +621,8 @@ def _wire_form_handlers(ctx: JobContext, session: AgentSession[LeadInfo]) -> Non
             and isinstance(agent, SchedulerAgent)
             and not agent._done
         ):
-            asyncio.create_task(agent._finish())
+            t = asyncio.create_task(agent._finish())
+            pending_tasks.append(t)
 
     @ctx.room.local_participant.register_rpc_method(RPC_SUBMIT_SCHEDULING)
     async def submit_scheduling(data: rtc.RpcInvocationData) -> str:
@@ -473,7 +642,8 @@ def _wire_form_handlers(ctx: JobContext, session: AgentSession[LeadInfo]) -> Non
         except Exception:
             return
         if msg.get("type") in ("scheduling_form", "scheduling_submit"):
-            asyncio.create_task(ingest(msg))
+            t = asyncio.create_task(ingest(msg))
+            pending_tasks.append(t)
 
 
 @server.rtc_session(agent_name="maneuver")
